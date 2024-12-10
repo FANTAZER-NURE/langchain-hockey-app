@@ -2,15 +2,15 @@
 import express from 'express';
 import bodyParser from 'body-parser';
 import dotenv from 'dotenv';
-import { ChatOpenAI } from '@langchain/openai';
+import { ChatOpenAI, OpenAIEmbeddings } from '@langchain/openai';
 import { JsonOutputParser } from '@langchain/core/output_parsers';
 import { ChatPromptTemplate } from '@langchain/core/prompts';
 import { createStuffDocumentsChain } from 'langchain/chains/combine_documents';
 import { Document } from '@langchain/core/documents';
-import { CheerioWebBaseLoader } from "@langchain/community/document_loaders/web/cheerio";
-import { RecursiveCharacterTextSplitter } from 'langchain/text_splitter'
-
-
+import { CheerioWebBaseLoader } from '@langchain/community/document_loaders/web/cheerio';
+import { RecursiveCharacterTextSplitter } from 'langchain/text_splitter';
+import { MemoryVectorStore } from 'langchain/vectorstores/memory';
+import { createRetrievalChain } from 'langchain/chains/retrieval';
 
 // Initialize environment variables
 dotenv.config();
@@ -125,12 +125,53 @@ const json = {
 };
 
 // Create prompt template
+// const gameAnalysisPrompt = ChatPromptTemplate.fromTemplate(`
+//   Analyze the following hockey game data and provide insights.
+//   Return ONLY a JSON object with no additional text or formatting.
+//   Provide detailed game analysis as text in the analysis.overall_analysis field.
+
+//   Required format:
+//   {{
+//     "game_summary": {{
+//       "score": {{
+//         "home": number,
+//         "away": number
+//       }},
+//       "shots_on_goal": {{
+//         "home": number,
+//         "away": number
+//       }},
+//       "key_stats": {{
+//         "home": {{
+//           "power_play_goals": number,
+//           "power_play_opportunities": number,
+//           "faceoff_percentage": number
+//         }},
+//         "away": {{
+//           "power_play_goals": number,
+//           "power_play_opportunities": number,
+//           "faceoff_percentage": number
+//         }}
+//       }},
+//       "analysis": {{
+//         "dominant_team": string,
+//         "key_factors": [string],
+//         "notable_statistics": [string],
+//         "overall_analysis": string
+//       }}
+//     }}
+//   }}
+
+//   Format Instructions: {format_instructions}
+//   Context: {context}
+//   Game Data: {data}
+// `);
+
+// Create prompt template for vector store retrieve
 const gameAnalysisPrompt = ChatPromptTemplate.fromTemplate(`
-  Analyze the following hockey game data and provide insights.
-  Return ONLY a JSON object with no additional text or formatting.
-  Provide detailed game analysis as text in the analysis.overall_analysis field.
+  Input: {input}
   
-  Required format:
+  Required output format:
   {{
     "game_summary": {{
       "score": {{
@@ -175,6 +216,7 @@ const gameAnalysisPrompt = ChatPromptTemplate.fromTemplate(`
 //     'Use this website to find the meaning of the stats keys in the data https://help.sportcontract.net/terms',
 // });
 
+// Load the website
 const loader = new CheerioWebBaseLoader(
   'https://help.sportcontract.net/terms',
   {
@@ -182,9 +224,10 @@ const loader = new CheerioWebBaseLoader(
   }
 );
 
+// Split the website into chunks
 const splitter = new RecursiveCharacterTextSplitter({
-  chunkSize: 200,
-  chunkOverlap: 20,
+  chunkSize: 1000,
+  chunkOverlap: 200,
 });
 
 // API Routes
@@ -198,16 +241,29 @@ app.get('/', async (req, res) => {
 
     const docs = await loader.load();
     const splitDocs = await splitter.splitDocuments(docs);
+    const embeddings = new OpenAIEmbeddings();
+    const vectorStore = await MemoryVectorStore.fromDocuments(
+      splitDocs,
+      embeddings
+    );
 
-    console.log(splitDocs);
+    const retriever = vectorStore.asRetriever();
+    const retrievalChain = await createRetrievalChain({
+      combineDocsChain: chain2,
+      retriever: retriever,
+    });
 
-    const response = await chain2.invoke({
+    const response = await retrievalChain.invoke({
+      input: `Analyze the following hockey game data and provide insights.
+Return ONLY a JSON object with no additional text or formatting.
+Provide detailed game analysis as text in the analysis.overall_analysis field.`,
       format_instructions: parser.getFormatInstructions(),
       data: JSON.stringify(json),
-      // context:
-      //   'Use this website to find the meaning of the stats keys in the data https://help.sportcontract.net/terms',
-      context: [...docs],
+      context:
+        'Use the retrieved documents to understand the meaning of hockey statistics.',
     });
+
+    console.log(response);
 
     // Ensure we're returning a proper JSON object
     if (typeof response === 'string') {
